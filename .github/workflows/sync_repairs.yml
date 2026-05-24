@@ -1,15 +1,14 @@
 name: Sync Repairs from HireHop
 
-on:
+"on":
   schedule:
-    - cron: '0 8 * * *'   # 08:00 UTC daily
-    - cron: '0 16 * * *'  # 16:00 UTC daily
-  workflow_dispatch:       # allows manual trigger from GitHub UI
+    - cron: '0 8 * * *'
+    - cron: '0 16 * * *'
+  workflow_dispatch:
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,7 +21,7 @@ jobs:
       - name: Run HireHop repairs sync
         env:
           HIREHOP_EMAIL: ${{ secrets.HIREHOP_EMAIL }}
-          HIREHOP_PASS:  ${{ secrets.HIREHOP_PASS }}
-          SB_URL:        ${{ secrets.SB_URL }}
-          SB_KEY:        ${{ secrets.SB_KEY }}
+          HIREHOP_PASS: ${{ secrets.HIREHOP_PASS }}
+          SB_URL: ${{ secrets.SB_URL }}
+          SB_KEY: ${{ secrets.SB_KEY }}
         run: node hirehop_repairs_export.js
