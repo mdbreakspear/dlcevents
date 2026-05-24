@@ -18,13 +18,13 @@ const path = require("path");
 const HIREHOP_BASE   = "https://myhirehop.com";
 const HIREHOP_CO     = "DEFTR";
 const HIREHOP_EMAIL  = "lorraine@dlcevents.com";
-const HIREHOP_PASS   = "hirehopapi1993";
+const HIREHOP_PASS   = process.env.HIREHOP_PASS;
 const HIREHOP_DEPOT  = [2];
 const HIREHOP_STATUS = ["0","0.5","1","2","2.5","3","4","5","5.5","6","7","8","9",
                         "10","10.1","10.2","10.3","10.4","10.5","10.6","11"];
 
 const SB_URL = "https://otvxgiujssoyzrfkdlzb.supabase.co";
-const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im90dnhnaXVqc3NveXpyZmtkbHpiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzczNzUxMDUsImV4cCI6MjA5Mjk1MTEwNX0.F7Ewsx6s3ZbeErm7gYCX4CJExgUvZF_NuzUrca6M2C8";
+const SB_KEY = process.env.SUPABASE_KEY;
 const J_TABLE = "Jobs";
 
 // Columns the HTML allows into Supabase (matches J_UPLOAD_ALLOWED_COLUMNS)
