@@ -18,6 +18,9 @@ jobs:
         with:
           node-version: '20'
 
+      - name: List files (debug)
+        run: ls -la
+
       - name: Run HireHop repairs sync
         env:
           HIREHOP_EMAIL: ${{ secrets.HIREHOP_EMAIL }}
