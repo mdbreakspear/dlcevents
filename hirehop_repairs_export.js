@@ -146,6 +146,35 @@ async function sbRequest(method, path, body) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+
+// ── Supabase error + run reporting ───────────────────────────────────────────────────────────
+async function sbReportSyncError(errorDetail, context) {
+  try {
+    await sbRequest("POST", "/SyncErrors", {
+      sync_name:    "HireHop \u2192 Supabase (Repairs)",
+      error_detail: String(errorDetail ?? "Unknown error").slice(0, 500),
+      context:      context ? String(context).slice(0, 200) : null,
+      created_at:   new Date().toISOString(),
+    });
+  } catch(e) {
+    console.warn("  \u26a0 Could not write to SyncErrors table:", e.message);
+  }
+}
+
+async function sbWriteSyncRun(status, detail) {
+  try {
+    await sbRequest("POST", "/SyncRuns", {
+      sync_name: "HireHop \u2192 Supabase (Repairs)",
+      tab:       "repairs",
+      status,
+      detail:    detail ? String(detail).slice(0, 500) : null,
+      ran_at:    new Date().toISOString(),
+    });
+  } catch(e) {
+    console.warn("  \u26a0 Could not write to SyncRuns table:", e.message);
+  }
+}
+
 async function main() {
   console.log("=== HireHop → Supabase  Repairs Sync ===");
   console.log(`    ${new Date().toISOString()}\n`);
@@ -181,7 +210,13 @@ async function main() {
   console.log("\n✅ Sync complete");
 }
 
-main().catch(err => {
+  console.log("\n✅ Sync complete");
+  await sbWriteSyncRun("success", `${inserted} repairs synced from HireHop`);
+}
+
+main().catch(async err => {
   console.error("\n❌ Fatal error:", err.message);
+  await sbReportSyncError(err.message, "Fatal — sync did not complete").catch(() => {});
+  await sbWriteSyncRun("failure", err.message).catch(() => {});
   process.exit(1);
 });
