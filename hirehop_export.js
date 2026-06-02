@@ -241,6 +241,36 @@ async function sbUpdate(jobId, payload) {
   return sbRequest("PATCH", `/${J_TABLE}?Job=eq.${encodeURIComponent(jobId)}`, payload);
 }
 
+// Write a row to SyncErrors so the CRM notifications panel can surface it.
+// Silently swallows its own errors so error reporting never crashes the sync.
+async function sbReportSyncError(errorDetail, context) {
+  try {
+    await sbRequest("POST", "/SyncErrors", {
+      sync_name:    "HireHop → Supabase",
+      error_detail: String(errorDetail ?? "Unknown error").slice(0, 500),
+      context:      context ? String(context).slice(0, 200) : null,
+      created_at:   new Date().toISOString(),
+    });
+  } catch(e) {
+    console.warn("  ⚠ Could not write to SyncErrors table:", e.message);
+  }
+}
+
+// Write a sync run record to SyncRuns so the CRM shows last-run status.
+async function sbWriteSyncRun(status, detail) {
+  try {
+    await sbRequest("POST", "/SyncRuns", {
+      sync_name:  "HireHop → Supabase (Jobs)",
+      tab:        "jobs",
+      status:     status,
+      detail:     detail ? String(detail).slice(0, 500) : null,
+      ran_at:     new Date().toISOString(),
+    });
+  } catch(e) {
+    console.warn("  ⚠ Could not write to SyncRuns table:", e.message);
+  }
+}
+
 // ── Canonical value for change detection (mirrors jCanonicalUploadValue) ───
 function canonical(v, col) {
   if (v == null) return "";
@@ -306,10 +336,19 @@ async function main() {
       summary.failed++;
       summary.errors.push(`Job ${jobId}: ${e.message}`);
       console.error(`  ❌ Job ${jobId}:`, e.message);
+      await sbReportSyncError(e.message, `Job ${jobId}`);
     }
   }
 
-  // 3. Report
+  // 3. If there were row-level failures, write one summary error to SyncErrors
+  if (summary.failed > 0) {
+    await sbReportSyncError(
+      `${summary.failed} job(s) failed to sync. First error: ${summary.errors[0]}`,
+      `${summary.inserted} inserted, ${summary.updated} updated, ${summary.unchanged} unchanged`
+    );
+  }
+
+  // 4. Report
   console.log("\n=== Sync complete ===");
   console.log(`  Inserted:  ${summary.inserted}`);
   console.log(`  Updated:   ${summary.updated}`);
@@ -321,7 +360,15 @@ async function main() {
     summary.errors.forEach(e => console.log(" ", e));
   }
 
-  // 4. Save a local CSV backup as well
+  // 4. Write sync run record
+  await sbWriteSyncRun(
+    summary.failed === 0 ? "success" : "partial",
+    summary.failed === 0
+      ? `${summary.inserted} inserted, ${summary.updated} updated, ${summary.unchanged} unchanged`
+      : `${summary.failed} failed. ${summary.errors[0] || ''}`
+  );
+
+  // 5. Save a local CSV backup as well
   const now      = new Date();
   const stamp    = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,"0")}${String(now.getDate()).padStart(2,"0")}`;
   const filename = path.join(__dirname, `Job_Income_${stamp}.csv`);
@@ -338,7 +385,9 @@ async function main() {
   console.log(`\n  CSV backup: ${filename}`);
 }
 
-main().catch(err => {
+main().catch(async err => {
   console.error("\n❌ Fatal error:", err.message);
+  await sbReportSyncError(err.message, "Fatal — sync did not complete").catch(() => {});
+  await sbWriteSyncRun("failure", err.message).catch(() => {});
   process.exit(1);
 });
