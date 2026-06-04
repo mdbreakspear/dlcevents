@@ -104,6 +104,8 @@ async function login() {
     redirect: "manual",
   });
   r1.headers.forEach((v,k) => { if(k.toLowerCase()==="set-cookie") parseCookies(jar,v); });
+  console.log(`  Step 1 status: ${r1.status}, cookies: ${JSON.stringify(Object.keys(jar))}`);
+  console.log(`  Logging in as: ${HIREHOP_EMAIL}, pass set: ${!!HIREHOP_PASS}`);
 
   const r2 = await fetch(`${HIREHOP_BASE}/login_msg.php`, {
     method: "POST",
@@ -112,6 +114,9 @@ async function login() {
     redirect: "manual",
   });
   r2.headers.forEach((v,k) => { if(k.toLowerCase()==="set-cookie") parseCookies(jar,v); });
+  console.log(`  Step 2 status: ${r2.status}, cookies: ${JSON.stringify(Object.keys(jar))}`);
+  const r2body = await r2.text().catch(()=>'');
+  console.log(`  Step 2 body: ${r2body.slice(0,300)}`);
 
   if (!jar["id"] || !jar["password"]) throw new Error("Login failed — missing session cookies");
   console.log(`  ✅ Logged in (user ${jar["id"]})`);
