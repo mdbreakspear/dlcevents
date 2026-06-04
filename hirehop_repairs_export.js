@@ -82,7 +82,6 @@ async function fetchRepairs(jar, maxAttempts = 4, delayMs = 15000) {
       });
       const text = await res.text();
 
-      // Transient server errors — retry
       if (res.status === 502 || res.status === 503 || res.status === 504) {
         throw new Error(`HTTP ${res.status} (transient)`);
       }
@@ -126,13 +125,12 @@ function transform(raw) {
 }
 
 // ── Raw Supabase REST call ────────────────────────────────────────────────────
-async function sb(method, path, body, extraHeaders = {}) {
+async function sb(method, path, body) {
   const res = await fetch(`${SB_URL}/rest/v1${path}`, {
     method,
     headers: {
       apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
       "Content-Type": "application/json", Prefer: "return=minimal",
-      ...extraHeaders,
     },
     body: body != null ? JSON.stringify(body) : undefined,
   });
@@ -141,7 +139,7 @@ async function sb(method, path, body, extraHeaders = {}) {
   try { return text ? JSON.parse(text) : null; } catch { return null; }
 }
 
-// ── Fetch ALL existing rows from Supabase ─────────────────────────────────────
+// ── Fetch ALL existing rows from Supabase (throws on any error) ───────────────
 async function fetchAllExisting() {
   let rows = [], offset = 0;
   while (true) {
@@ -149,8 +147,11 @@ async function fetchAllExisting() {
       `${SB_URL}/rest/v1/${REP_TABLE}?select=id,hirehop_id,archived,comments,responsible&limit=1000&offset=${offset}`,
       { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
     );
-    const chunk = await res.json();
-    if (!Array.isArray(chunk) || !chunk.length) break;
+    const text = await res.text();
+    if (res.status >= 400) throw new Error(`fetchAllExisting → ${res.status}: ${text.slice(0, 400)}`);
+    const chunk = JSON.parse(text);
+    if (!Array.isArray(chunk)) throw new Error(`fetchAllExisting: unexpected shape: ${text.slice(0, 200)}`);
+    if (!chunk.length) break;
     rows = rows.concat(chunk);
     if (chunk.length < 1000) break;
     offset += 1000;
@@ -190,47 +191,50 @@ async function main() {
   const liveById = new Map(incoming.map(r => [r.hirehop_id, r]));
   console.log(`  Transformed: ${incoming.length} valid rows`);
 
-  // Read everything currently in Supabase (to detect archived/restored + items to archive)
+  // Read everything currently in Supabase — throws on error so we never run blind
   console.log("\nReading existing Supabase rows...");
   const existing    = await fetchAllExisting();
   const existingMap = new Map(existing.filter(r => r.hirehop_id).map(r => [r.hirehop_id, r]));
   console.log(`  Found ${existing.length} existing rows`);
 
   const now = new Date().toISOString();
-  let upserted = 0, restored = 0, archived = 0;
+  let inserted = 0, updated = 0, archived = 0, restored = 0;
 
-  // ── 1. UPSERT all live HireHop items (on conflict hirehop_id) ────────────
-  // Uses PostgreSQL ON CONFLICT DO UPDATE via PostgREST's resolution=merge-duplicates.
-  // This is atomic — a unique constraint on hirehop_id prevents any duplicate rows.
-  // NOTE: comments and responsible are excluded from the upsert payload so they are
-  //       never overwritten — they live only in Supabase (user-managed fields).
-  console.log("\nUpserting live HireHop items...");
-  for (let i = 0; i < incoming.length; i += 200) {
-    const batch = incoming.slice(i, i + 200).map(r => ({
-      hirehop_id:     r.hirehop_id,
-      qty:            r.qty,
-      title:          r.title,
-      barcode:        r.barcode,
-      serial:         r.serial,
-      memo:           r.memo,
-      status:         r.status,
-      date_in_repair: r.date_in_repair,
-      archived:       'Current',
-      updated_at:     now,
-    }));
+  // ── 1. For each live HireHop item: PATCH if exists, POST if new ───────────
+  // NOTE: A UNIQUE constraint on hirehop_id ensures a POST can never create a
+  //       duplicate — it will 409 if somehow existingMap was wrong, rather than
+  //       silently inserting a second row.
+  // NOTE: comments and responsible are never included — those are user-managed.
+  console.log("\nProcessing live HireHop items...");
+  for (const r of incoming) {
+    const prev = existingMap.get(r.hirehop_id);
 
-    await sb("POST", `/${REP_TABLE}`, batch, {
-      Prefer: "resolution=merge-duplicates,return=minimal",
-    });
-    upserted += batch.length;
-
-    // Count restored (were archived, now back in feed)
-    for (const r of batch) {
-      const prev = existingMap.get(r.hirehop_id);
-      if (prev && String(prev.archived || '').toLowerCase() === 'archived') restored++;
+    if (prev) {
+      const wasArchived = String(prev.archived || '').toLowerCase() === 'archived';
+      await sb("PATCH", `/${REP_TABLE}?id=eq.${prev.id}`, {
+        qty:            r.qty,
+        title:          r.title,
+        barcode:        r.barcode,
+        serial:         r.serial,
+        memo:           r.memo,
+        status:         r.status,
+        date_in_repair: r.date_in_repair,
+        archived:       'Current',
+        updated_at:     now,
+      });
+      updated++;
+      if (wasArchived) restored++;
+    } else {
+      await sb("POST", `/${REP_TABLE}`, {
+        ...r,
+        archived:   'Current',
+        updated_at: now,
+      });
+      inserted++;
     }
   }
-  console.log(`  ✅ Upserted ${upserted} rows (${restored} restored from archived)`);
+  console.log(`  ✅ Updated ${updated} rows (${restored} restored from archived)`);
+  console.log(`  ✅ Inserted ${inserted} new rows`);
 
   // ── 2. Any existing row NOT in the live feed → mark Archived ────────────
   console.log("\nChecking for items to archive...");
@@ -255,7 +259,7 @@ async function main() {
 
   console.log("\n✅ Sync complete");
   await writeSyncRun("success",
-    `${upserted} upserted · ${archived} archived · ${restored} restored`);
+    `${updated} updated · ${inserted} inserted · ${archived} archived · ${restored} restored`);
 }
 
 main().catch(async err => {
