@@ -68,24 +68,45 @@ async function login() {
   return jar;
 }
 
-// ── Fetch repairs from HireHop ────────────────────────────────────────────────
-async function fetchRepairs(jar) {
+// ── Fetch repairs from HireHop (with retries) ────────────────────────────────
+async function fetchRepairs(jar, maxAttempts = 4, delayMs = 15000) {
   const url = `${HIREHOP_BASE}/reports/damaged_list.php`
             + `?depot=${encodeURIComponent(JSON.stringify(HIREHOP_DEPOT))}`;
   console.log(`  GET ${url}`);
-  const res  = await fetch(url, {
-    headers: { accept: "application/json", "x-requested-with": "XMLHttpRequest",
-               referer: `${HIREHOP_BASE}/reports/damaged.php`, cookie: cookieStr(jar) },
-  });
-  const text = await res.text();
-  if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
-  if (text.trim().startsWith("<")) throw new Error("Got HTML — login may have failed");
-  const data = JSON.parse(text);
-  if (data?.error) throw new Error(`HireHop error: ${data.error}`);
-  const rows = data.data ?? (Array.isArray(data) ? data : null);
-  if (!Array.isArray(rows)) throw new Error("Unexpected response shape: " + text.slice(0, 200));
-  console.log(`  ✅ Fetched ${rows.length} repair items`);
-  return rows;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const res  = await fetch(url, {
+        headers: { accept: "application/json", "x-requested-with": "XMLHttpRequest",
+                   referer: `${HIREHOP_BASE}/reports/damaged.php`, cookie: cookieStr(jar) },
+      });
+      const text = await res.text();
+
+      // Transient server errors — retry
+      if (res.status === 502 || res.status === 503 || res.status === 504) {
+        throw new Error(`HTTP ${res.status} (transient)`);
+      }
+      if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
+      if (text.trim().startsWith("<")) throw new Error("Got HTML — login may have failed");
+
+      const data = JSON.parse(text);
+      if (data?.error) throw new Error(`HireHop error: ${data.error}`);
+      const rows = data.data ?? (Array.isArray(data) ? data : null);
+      if (!Array.isArray(rows)) throw new Error("Unexpected response shape: " + text.slice(0, 200));
+
+      console.log(`  ✅ Fetched ${rows.length} repair items`);
+      return rows;
+
+    } catch (err) {
+      const transient = /transient|fetch failed|ECONNRESET|ETIMEDOUT/i.test(err.message);
+      if (attempt < maxAttempts && transient) {
+        console.warn(`  ⚠ Attempt ${attempt}/${maxAttempts} failed: ${err.message} — retrying in ${delayMs/1000}s...`);
+        await new Promise(r => setTimeout(r, delayMs));
+      } else {
+        throw err;
+      }
+    }
+  }
 }
 
 // ── Transform one HireHop row ─────────────────────────────────────────────────
@@ -238,7 +259,8 @@ async function main() {
 }
 
 main().catch(async err => {
-  console.error("\n❌ Fatal error:", err.message);
-  await writeSyncRun("failure", err.message).catch(() => {});
+  const transient = /502|503|504|transient|ECONNRESET|ETIMEDOUT/i.test(err.message);
+  console.error(`\n❌ Fatal error${transient ? " (transient — HireHop may be temporarily down)" : ""}:`, err.message);
+  await writeSyncRun(transient ? "transient_failure" : "failure", err.message).catch(() => {});
   process.exit(1);
 });
