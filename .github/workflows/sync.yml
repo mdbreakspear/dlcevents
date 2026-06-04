@@ -15,10 +15,10 @@ jobs:
         with:
           node-version: '24'
 
-     - name: Run HireHop → Supabase sync
-  run: node hirehop_export.js
-  env:
-    SB_KEY: ${{ secrets.SB_KEY }}
-    SB_URL: ${{ secrets.SB_URL }}
-    HIREHOP_PASS: ${{ secrets.HIREHOP_PASS }}
-    HIREHOP_EMAIL: ${{ secrets.HIREHOP_EMAIL }}
+      - name: Run HireHop → Supabase sync
+        run: node hirehop_export.js
+        env:
+          SB_KEY: ${{ secrets.SB_KEY }}
+          SB_URL: ${{ secrets.SB_URL }}
+          HIREHOP_PASS: ${{ secrets.HIREHOP_PASS }}
+          HIREHOP_EMAIL: ${{ secrets.HIREHOP_EMAIL }}
