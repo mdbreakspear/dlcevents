@@ -144,7 +144,7 @@ async function fetchAllExisting() {
   let rows = [], offset = 0;
   while (true) {
     const res = await fetch(
-      `${SB_URL}/rest/v1/${REP_TABLE}?select=id,hirehop_id,archived,comments,responsible&limit=1000&offset=${offset}`,
+      `${SB_URL}/rest/v1/${REP_TABLE}?select=id,hirehop_id,archived,comments&limit=1000&offset=${offset}`,
       { headers: { apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}` } }
     );
     const text = await res.text();
