@@ -208,9 +208,6 @@ async function main() {
 
   console.log(`  ✅ Inserted ${inserted} rows`);
   console.log("\n✅ Sync complete");
-}
-
-  console.log("\n✅ Sync complete");
   await sbWriteSyncRun("success", `${inserted} repairs synced from HireHop`);
 }
 
