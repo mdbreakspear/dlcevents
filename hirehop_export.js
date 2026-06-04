@@ -24,7 +24,7 @@ const HIREHOP_STATUS = ["0","0.5","1","2","2.5","3","4","5","5.5","6","7","8","9
                         "10","10.1","10.2","10.3","10.4","10.5","10.6","11"];
 
 const SB_URL = "https://otvxgiujssoyzrfkdlzb.supabase.co";
-const SB_KEY = process.env.SUPABASE_KEY;
+const SB_KEY = process.env.SB_KEY;
 const J_TABLE = "Jobs";
 
 // Columns the HTML allows into Supabase (matches J_UPLOAD_ALLOWED_COLUMNS)
