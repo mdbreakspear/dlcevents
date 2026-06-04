@@ -5,14 +5,24 @@
  * Runs via GitHub Actions on a schedule (08:00 and 16:00 UTC daily).
  * Credentials are stored as GitHub Actions Secrets — never hardcoded.
  *
+ * Strategy: UPSERT (not delete+insert) so that manually-added comments,
+ * responsible fields, and archived flags are preserved across syncs.
+ *
+ * Archive logic:
+ *   - Any row in Supabase with a hirehop_id that does NOT appear in the
+ *     current HireHop feed is marked archived = 'Archived'.
+ *   - Rows already archived stay archived (returned to stock = done).
+ *   - If a previously-archived item reappears in HireHop it is restored
+ *     to archived = 'Current'.
+ *
  * Required GitHub Secrets (Settings → Secrets → Actions → New repository secret):
  *   HIREHOP_EMAIL   lorraine@dlcevents.com
  *   HIREHOP_PASS    hirehopapi1993
  *   SB_URL          https://otvxgiujssoyzrfkdlzb.supabase.co
- *   SB_KEY          (your Supabase anon key)
+ *   SB_KEY          (your Supabase service_role key)
  */
 
-// ── Config (from environment — set as GitHub Secrets) ────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 const HIREHOP_BASE  = "https://myhirehop.com";
 const HIREHOP_CO    = "DEFTR";
 const HIREHOP_EMAIL = process.env.HIREHOP_EMAIL;
@@ -23,11 +33,10 @@ const SB_URL    = process.env.SB_URL;
 const SB_KEY    = process.env.SB_KEY;
 const REP_TABLE = "Repairs";
 
-// Validate secrets are present
 if (!HIREHOP_EMAIL || !HIREHOP_PASS) throw new Error("Missing HIREHOP_EMAIL or HIREHOP_PASS secret");
 if (!SB_URL || !SB_KEY)             throw new Error("Missing SB_URL or SB_KEY secret");
 
-// ── Status map (confirmed from live API) ─────────────────────────────────────
+// ── Status map ────────────────────────────────────────────────────────────────
 const STATUS_MAP = {
   "1.0": "Flagged",
   "2.0": "In repair",
@@ -83,7 +92,6 @@ async function fetchRepairs(jar) {
             + `?depot=${encodeURIComponent(JSON.stringify(HIREHOP_DEPOT))}`;
 
   console.log(`  GET ${url}`);
-
   const res  = await fetch(url, {
     headers: {
       "accept":           "application/json",
@@ -136,7 +144,7 @@ async function sbRequest(method, path, body) {
       "apikey":        SB_KEY,
       "Authorization": `Bearer ${SB_KEY}`,
       "Content-Type":  "application/json",
-      "Prefer":        "return=minimal",
+      "Prefer":        method === "POST" ? "resolution=merge-duplicates,return=minimal" : "return=minimal",
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -145,75 +153,135 @@ async function sbRequest(method, path, body) {
   try { return text ? JSON.parse(text) : null; } catch(e) { return null; }
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
-
-// ── Supabase error + run reporting ───────────────────────────────────────────────────────────
-async function sbReportSyncError(errorDetail, context) {
-  try {
-    await sbRequest("POST", "/SyncErrors", {
-      sync_name:    "HireHop \u2192 Supabase (Repairs)",
-      error_detail: String(errorDetail ?? "Unknown error").slice(0, 500),
-      context:      context ? String(context).slice(0, 200) : null,
-      created_at:   new Date().toISOString(),
-    });
-  } catch(e) {
-    console.warn("  \u26a0 Could not write to SyncErrors table:", e.message);
-  }
-}
-
+// ── Sync error / run reporting ────────────────────────────────────────────────
 async function sbWriteSyncRun(status, detail) {
   try {
     await sbRequest("POST", "/SyncRuns", {
-      sync_name: "HireHop \u2192 Supabase (Repairs)",
+      sync_name: "HireHop → Supabase (Repairs)",
       tab:       "repairs",
       status,
       detail:    detail ? String(detail).slice(0, 500) : null,
       ran_at:    new Date().toISOString(),
     });
   } catch(e) {
-    console.warn("  \u26a0 Could not write to SyncRuns table:", e.message);
+    console.warn("  ⚠ Could not write to SyncRuns table:", e.message);
   }
 }
 
+// ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log("=== HireHop → Supabase  Repairs Sync ===");
   console.log(`    ${new Date().toISOString()}\n`);
 
-  const jar    = await login();
+  const jar  = await login();
 
-  console.log("\nFetching repair list...");
-  const rows   = await fetchRepairs(jar);
+  console.log("\nFetching repair list from HireHop...");
+  const rows = await fetchRepairs(jar);
 
   if (!rows.length) {
     console.log("  ℹ️  No items returned — nothing to sync.");
+    await sbWriteSyncRun("success", "0 items in HireHop feed — no changes made");
     return;
   }
 
-  const mapped = rows
+  const incoming = rows
     .map(transformRow)
-    .filter(r => r.title || r.barcode || r.serial);
+    .filter(r => r.hirehop_id && (r.title || r.barcode || r.serial));
 
-  console.log(`  Transformed: ${mapped.length} rows`);
+  const liveIds = new Set(incoming.map(r => r.hirehop_id));
+  console.log(`  Transformed: ${incoming.length} rows from HireHop`);
 
-  console.log(`\nReplacing "${REP_TABLE}" in Supabase...`);
-  await sbRequest("DELETE", `/${REP_TABLE}?id=neq.0`);
-  console.log("  ✅ Cleared existing rows");
+  // ── Fetch existing Supabase rows ──────────────────────────────────────────
+  console.log("\nReading existing Supabase rows...");
+  let existing = [], from = 0;
+  while (true) {
+    const res = await fetch(`${SB_URL}/rest/v1/${REP_TABLE}?select=id,hirehop_id,archived,comments,responsible&limit=1000&offset=${from}`, {
+      headers: { "apikey": SB_KEY, "Authorization": `Bearer ${SB_KEY}` },
+    });
+    const chunk = await res.json();
+    if (!Array.isArray(chunk)) break;
+    existing = existing.concat(chunk);
+    if (chunk.length < 1000) break;
+    from += 1000;
+  }
+  console.log(`  Found ${existing.length} existing rows in Supabase`);
 
+  const existingByHirehopId = new Map(existing.filter(r => r.hirehop_id).map(r => [r.hirehop_id, r]));
+
+  // ── Upsert live items (preserve comments/responsible/archived for existing rows) ──
+  console.log("\nUpserting live repair items...");
+  let upserted = 0;
   const BATCH = 200;
-  let inserted = 0;
-  for (let i = 0; i < mapped.length; i += BATCH) {
-    await sbRequest("POST", `/${REP_TABLE}`, mapped.slice(i, i + BATCH));
-    inserted += Math.min(BATCH, mapped.length - i);
+  for (let i = 0; i < incoming.length; i += BATCH) {
+    const batch = incoming.slice(i, i + BATCH).map(r => {
+      const prev = existingByHirehopId.get(r.hirehop_id);
+      return {
+        ...r,
+        // Preserve user-edited fields if row already exists
+        comments:    prev?.comments    ?? null,
+        responsible: prev?.responsible ?? null,
+        // Item is back in HireHop — restore to Current if it was archived
+        archived:    'Current',
+        updated_at:  new Date().toISOString(),
+        // Use existing id for upsert if we have it, otherwise insert new
+        ...(prev ? { id: prev.id } : {}),
+      };
+    });
+
+    const res = await fetch(`${SB_URL}/rest/v1/${REP_TABLE}`, {
+      method: "POST",
+      headers: {
+        "apikey":        SB_KEY,
+        "Authorization": `Bearer ${SB_KEY}`,
+        "Content-Type":  "application/json",
+        "Prefer":        "resolution=merge-duplicates,return=minimal",
+      },
+      body: JSON.stringify(batch),
+    });
+    if (res.status >= 400) {
+      const t = await res.text();
+      throw new Error(`Upsert failed: ${res.status} ${t.slice(0, 300)}`);
+    }
+    upserted += batch.length;
+  }
+  console.log(`  ✅ Upserted ${upserted} rows`);
+
+  // ── Archive rows no longer in HireHop feed ────────────────────────────────
+  console.log("\nChecking for items to archive...");
+  const toArchive = existing.filter(r =>
+    r.hirehop_id &&
+    !liveIds.has(r.hirehop_id) &&
+    String(r.archived || '').toLowerCase() !== 'archived'
+  );
+
+  if (toArchive.length) {
+    const archiveIds = toArchive.map(r => r.id);
+    const res = await fetch(`${SB_URL}/rest/v1/${REP_TABLE}?id=in.(${archiveIds.join(',')})`, {
+      method: "PATCH",
+      headers: {
+        "apikey":        SB_KEY,
+        "Authorization": `Bearer ${SB_KEY}`,
+        "Content-Type":  "application/json",
+        "Prefer":        "return=minimal",
+      },
+      body: JSON.stringify({ archived: 'Archived', updated_at: new Date().toISOString() }),
+    });
+    if (res.status >= 400) {
+      const t = await res.text();
+      console.warn(`  ⚠ Archive patch failed: ${res.status} ${t.slice(0, 200)}`);
+    } else {
+      console.log(`  ✅ Archived ${toArchive.length} item(s) no longer in HireHop`);
+    }
+  } else {
+    console.log("  ✅ No items to archive");
   }
 
-  console.log(`  ✅ Inserted ${inserted} rows`);
   console.log("\n✅ Sync complete");
-  await sbWriteSyncRun("success", `${inserted} repairs synced from HireHop`);
+  await sbWriteSyncRun("success", `${upserted} upserted · ${toArchive.length} archived`);
 }
 
 main().catch(async err => {
   console.error("\n❌ Fatal error:", err.message);
-  await sbReportSyncError(err.message, "Fatal — sync did not complete").catch(() => {});
   await sbWriteSyncRun("failure", err.message).catch(() => {});
   process.exit(1);
 });
