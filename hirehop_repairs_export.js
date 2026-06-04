@@ -105,12 +105,13 @@ function transform(raw) {
 }
 
 // ── Raw Supabase REST call ────────────────────────────────────────────────────
-async function sb(method, path, body) {
+async function sb(method, path, body, extraHeaders = {}) {
   const res = await fetch(`${SB_URL}/rest/v1${path}`, {
     method,
     headers: {
       apikey: SB_KEY, Authorization: `Bearer ${SB_KEY}`,
       "Content-Type": "application/json", Prefer: "return=minimal",
+      ...extraHeaders,
     },
     body: body != null ? JSON.stringify(body) : undefined,
   });
@@ -168,53 +169,47 @@ async function main() {
   const liveById = new Map(incoming.map(r => [r.hirehop_id, r]));
   console.log(`  Transformed: ${incoming.length} valid rows`);
 
-  // Read everything currently in Supabase
+  // Read everything currently in Supabase (to detect archived/restored + items to archive)
   console.log("\nReading existing Supabase rows...");
   const existing    = await fetchAllExisting();
   const existingMap = new Map(existing.filter(r => r.hirehop_id).map(r => [r.hirehop_id, r]));
   console.log(`  Found ${existing.length} existing rows`);
 
   const now = new Date().toISOString();
-  let inserted = 0, updated = 0, archived = 0, restored = 0;
+  let upserted = 0, restored = 0, archived = 0;
 
-  // ── 1. For each item in the live HireHop feed: UPDATE or INSERT ──────────
-  console.log("\nProcessing live HireHop items...");
+  // ── 1. UPSERT all live HireHop items (on conflict hirehop_id) ────────────
+  // Uses PostgreSQL ON CONFLICT DO UPDATE via PostgREST's resolution=merge-duplicates.
+  // This is atomic — a unique constraint on hirehop_id prevents any duplicate rows.
+  // NOTE: comments and responsible are excluded from the upsert payload so they are
+  //       never overwritten — they live only in Supabase (user-managed fields).
+  console.log("\nUpserting live HireHop items...");
   for (let i = 0; i < incoming.length; i += 200) {
-    const batch = incoming.slice(i, i + 200);
+    const batch = incoming.slice(i, i + 200).map(r => ({
+      hirehop_id:     r.hirehop_id,
+      qty:            r.qty,
+      title:          r.title,
+      barcode:        r.barcode,
+      serial:         r.serial,
+      memo:           r.memo,
+      status:         r.status,
+      date_in_repair: r.date_in_repair,
+      archived:       'Current',
+      updated_at:     now,
+    }));
 
+    await sb("POST", `/${REP_TABLE}`, batch, {
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    });
+    upserted += batch.length;
+
+    // Count restored (were archived, now back in feed)
     for (const r of batch) {
       const prev = existingMap.get(r.hirehop_id);
-
-      if (prev) {
-        // Row exists — UPDATE HireHop fields, preserve user fields, restore if archived
-        const wasArchived = String(prev.archived || '').toLowerCase() === 'archived';
-        await sb("PATCH", `/${REP_TABLE}?id=eq.${prev.id}`, {
-          qty:            r.qty,
-          title:          r.title,
-          barcode:        r.barcode,
-          serial:         r.serial,
-          memo:           r.memo,
-          status:         r.status,
-          date_in_repair: r.date_in_repair,
-          archived:       'Current',   // restore if it was archived
-          updated_at:     now,
-          // comments and responsible are NOT touched — preserve whatever the user set
-        });
-        updated++;
-        if (wasArchived) restored++;
-      } else {
-        // Brand new item — INSERT
-        await sb("POST", `/${REP_TABLE}`, {
-          ...r,
-          archived:    'Current',
-          updated_at:  now,
-        });
-        inserted++;
-      }
+      if (prev && String(prev.archived || '').toLowerCase() === 'archived') restored++;
     }
   }
-  console.log(`  ✅ Updated ${updated} rows (${restored} restored from archived)`);
-  console.log(`  ✅ Inserted ${inserted} new rows`);
+  console.log(`  ✅ Upserted ${upserted} rows (${restored} restored from archived)`);
 
   // ── 2. Any existing row NOT in the live feed → mark Archived ────────────
   console.log("\nChecking for items to archive...");
@@ -225,7 +220,6 @@ async function main() {
   );
 
   if (toArchive.length) {
-    // PATCH in one request using id=in.(...)
     const ids = toArchive.map(r => r.id).join(',');
     await sb("PATCH", `/${REP_TABLE}?id=in.(${ids})`, {
       archived:   'Archived',
@@ -240,7 +234,7 @@ async function main() {
 
   console.log("\n✅ Sync complete");
   await writeSyncRun("success",
-    `${updated} updated · ${inserted} inserted · ${archived} archived · ${restored} restored`);
+    `${upserted} upserted · ${archived} archived · ${restored} restored`);
 }
 
 main().catch(async err => {
