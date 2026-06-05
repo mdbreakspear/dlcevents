@@ -18,6 +18,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { jsPDF }        = require('jspdf');
 const { createCanvas } = require('canvas');
 const { Chart, registerables } = require('chart.js');
+const WebSocket        = require('ws');
 const https            = require('https');
 const http             = require('http');
 const { URL }          = require('url');
@@ -35,7 +36,9 @@ if (!SB_URL || !SB_KEY || !DBX_TOKEN) {
   process.exit(1);
 }
 
-const db = createClient(SB_URL, SB_KEY);
+const db = createClient(SB_URL, SB_KEY, {
+  realtime: { transport: WebSocket },
+});
 
 // ─── FIELD ALIASES (mirrors the HTML) ───────────────────────────────────────
 const J_ALIASES = {
