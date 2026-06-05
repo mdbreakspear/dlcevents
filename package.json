@@ -1,0 +1,19 @@
+{
+  "name": "dlc-crm-reports",
+  "version": "1.0.0",
+  "description": "Automated weekly & monthly PDF reports for DLC Events CRM → Dropbox",
+  "main": "scripts/generate-report.js",
+  "scripts": {
+    "weekly": "node scripts/generate-report.js weekly",
+    "monthly": "node scripts/generate-report.js monthly"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "canvas": "^2.11.2",
+    "chart.js": "^4.4.0",
+    "jspdf": "^2.5.1"
+  }
+}
