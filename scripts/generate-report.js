@@ -5,7 +5,8 @@
  * Usage:  node scripts/generate-report.js weekly|monthly
  *
  * Secrets needed:
- *   SB_URL, SB_KEY, DROPBOX_ACCESS_TOKEN
+ *   SB_URL, SB_KEY,
+ *   DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN
  */
 'use strict';
 
@@ -20,14 +21,48 @@ const { dlcGenerateWeeklyReport, dlcGenerateMonthlyReport } = require('./report-
 Chart.register(...registerables);
 
 // ── Env ────────────────────────────────────────────────────────────────────
-const SB_URL    = process.env.SB_URL;
-const SB_KEY    = process.env.SB_KEY;
-const DBX_TOKEN = process.env.DROPBOX_ACCESS_TOKEN;
-const DROPBOX_FOLDER = '/New Structure/Sales/CRM Job Reports';
+const SB_URL          = process.env.SB_URL;
+const SB_KEY          = process.env.SB_KEY;
+const DBX_APP_KEY     = process.env.DROPBOX_APP_KEY;
+const DBX_APP_SECRET  = process.env.DROPBOX_APP_SECRET;
+const DBX_REFRESH     = process.env.DROPBOX_REFRESH_TOKEN;
+const DROPBOX_FOLDER  = '/New Structure/Sales/CRM Job Reports';
 
-if (!SB_URL || !SB_KEY || !DBX_TOKEN) {
-  console.error('Missing env vars: SB_URL, SB_KEY, DROPBOX_ACCESS_TOKEN');
+if (!SB_URL || !SB_KEY || !DBX_APP_KEY || !DBX_APP_SECRET || !DBX_REFRESH) {
+  console.error('Missing env vars: SB_URL, SB_KEY, DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN');
   process.exit(1);
+}
+
+// ── Dropbox: exchange refresh token for a fresh access token ───────────────
+async function getDropboxAccessToken() {
+  const credentials = Buffer.from(`${DBX_APP_KEY}:${DBX_APP_SECRET}`).toString('base64');
+  const body = `grant_type=refresh_token&refresh_token=${encodeURIComponent(DBX_REFRESH)}`;
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'api.dropbox.com',
+      path: '/oauth2/token',
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${credentials}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    };
+    const req = https.request(options, res => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (res.statusCode >= 400) reject(new Error(`Dropbox token error ${res.statusCode}: ${data}`));
+          else { console.log('🔑 Dropbox access token refreshed'); resolve(parsed.access_token); }
+        } catch(e) { reject(new Error(`Dropbox token parse error: ${data}`)); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }
 
 const db = createClient(SB_URL, SB_KEY, { realtime: { transport: WebSocket } });
@@ -60,6 +95,7 @@ async function fetchAllJobs() {
 
 // ── Dropbox upload ──────────────────────────────────────────────────────────
 async function uploadToDropbox(pdfBuffer, filename) {
+  const accessToken = await getDropboxAccessToken();
   const dropboxPath = DROPBOX_FOLDER + '/' + filename;
   console.log(`Uploading → ${dropboxPath}`);
   const buf = Buffer.from(pdfBuffer);
@@ -69,7 +105,7 @@ async function uploadToDropbox(pdfBuffer, filename) {
       path: '/2/files/upload',
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${DBX_TOKEN}`,
+        'Authorization': `Bearer ${accessToken}`,
         'Content-Type': 'application/octet-stream',
         'Dropbox-API-Arg': JSON.stringify({ path: dropboxPath, mode: 'overwrite', autorename: false, mute: false }),
         'Content-Length': buf.length,
