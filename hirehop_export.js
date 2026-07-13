@@ -26,6 +26,7 @@ const HIREHOP_STATUS = ["0","0.5","1","2","2.5","3","4","5","5.5","6","7","8","9
 const SB_URL = process.env.SB_URL || "https://otvxgiujssoyzrfkdlzb.supabase.co";
 const SB_KEY = process.env.SB_KEY;
 const J_TABLE = "Jobs";
+const JC_TABLE = "JobCostings";
 
 // Columns the HTML allows into Supabase (matches J_UPLOAD_ALLOWED_COLUMNS)
 const ALLOWED_COLUMNS = new Set([
@@ -246,6 +247,68 @@ async function sbUpdate(jobId, payload) {
   return sbRequest("PATCH", `/${J_TABLE}?Job=eq.${encodeURIComponent(jobId)}`, payload);
 }
 
+// ── JobCostings (HireHop "Known Job Costs" custom field) ───────────────────
+// The report returns the custom field flattened as the tilde key "~JobCosts"
+// (a formatted string, e.g. "1000.00"; empty string when unset). Parse it to a
+// number; return null when blank / non-numeric.
+function parseJobCosts(row) {
+  const raw = row["~JobCosts"];
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).replace(/,/g, "").trim();
+  if (s === "") return null;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Look up the existing costing row for a job (Job Cost only — that's all the
+// fill decision needs).
+async function sbFindCosting(jobId) {
+  const data = await sbRequest(
+    "GET",
+    `/${JC_TABLE}?Job=eq.${encodeURIComponent(jobId)}&select=Job,"Job Cost"&limit=1`
+  );
+  return (Array.isArray(data) && data.length) ? data[0] : null;
+}
+
+// Fill rule (a): HireHop is a FALLBACK cost source, never authoritative.
+// Write the HireHop JobCosts value only when the existing Job Cost is null OR 0
+// (i.e. no real Xero cost is present). A non-zero existing cost — which would
+// have come from a Xero Project Financials import — is left untouched.
+// Profit = Total − JobCosts. Applies to all job types.
+async function syncCosting(row, payload, summary) {
+  const jobId    = payload["Job"];
+  const jobCosts = parseJobCosts(row);
+  if (jobCosts === null) { summary.costSkipped++; return; }   // HireHop has no value → do nothing
+
+  // Total from the same report row (already mapped into the Jobs payload).
+  const totalNum = parseFloat(String(payload["Total"] ?? "").replace(/,/g, "").trim());
+  const total    = Number.isFinite(totalNum) ? totalNum : 0;
+  const profit   = total - jobCosts;
+
+  const existing    = await sbFindCosting(jobId);
+  const existingCost = existing && existing["Job Cost"] !== null && existing["Job Cost"] !== undefined
+    ? Number(existing["Job Cost"]) : null;
+
+  // Only fill when existing cost is null or exactly 0.
+  if (existingCost !== null && existingCost !== 0) { summary.costPreserved++; return; }
+
+  const nowIso = new Date().toISOString();
+  const body = {
+    Job:        jobId,
+    "Job Cost": jobCosts,
+    "Profit":   profit,
+    updated_at: nowIso,
+    updated_by: "HireHop sync",
+  };
+
+  if (existing) {
+    await sbRequest("PATCH", `/${JC_TABLE}?Job=eq.${encodeURIComponent(jobId)}`, body);
+  } else {
+    await sbRequest("POST", `/${JC_TABLE}`, body);
+  }
+  summary.costWritten++;
+}
+
 // Write a row to SyncErrors so the CRM notifications panel can surface it.
 // Silently swallows its own errors so error reporting never crashes the sync.
 async function sbReportSyncError(errorDetail, context) {
@@ -314,7 +377,8 @@ async function main() {
 
   // 2. Sync to Supabase
   console.log(`\nSyncing to Supabase (${J_TABLE})...`);
-  const summary = { inserted: 0, updated: 0, unchanged: 0, skipped: 0, failed: 0, errors: [] };
+  const summary = { inserted: 0, updated: 0, unchanged: 0, skipped: 0, failed: 0,
+                    costWritten: 0, costPreserved: 0, costSkipped: 0, errors: [] };
 
   for (const row of rows) {
     const payload = transformRow(row);
@@ -337,6 +401,9 @@ async function main() {
         await sbInsert(payload);
         summary.inserted++;
       }
+
+      // JobCostings fallback fill (HireHop "Known Job Costs" → Job Cost / Profit).
+      await syncCosting(row, payload, summary);
     } catch(e) {
       summary.failed++;
       summary.errors.push(`Job ${jobId}: ${e.message}`);
@@ -360,6 +427,9 @@ async function main() {
   console.log(`  Unchanged: ${summary.unchanged}`);
   console.log(`  Skipped:   ${summary.skipped}`);
   console.log(`  Failed:    ${summary.failed}`);
+  console.log(`  Costs written:   ${summary.costWritten}`);
+  console.log(`  Costs preserved: ${summary.costPreserved} (existing non-zero left intact)`);
+  console.log(`  Costs skipped:   ${summary.costSkipped} (no HireHop value)`);
   if (summary.errors.length) {
     console.log("\nErrors:");
     summary.errors.forEach(e => console.log(" ", e));
