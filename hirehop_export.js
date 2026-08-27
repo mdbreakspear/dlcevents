@@ -47,6 +47,7 @@ const ALLOWED_COLUMNS = new Set([
 //   job in each of those states and update accordingly.
 const STATUS_MAP = {
   "0":    "Enquiry",
+  "0.5":  "Followed Up",
   "1":    "Provisional",
   "2":    "Confirmed",
   "3":    "Prepped",
