@@ -340,6 +340,125 @@ async function sbWriteSyncRun(status, detail) {
   }
 }
 
+// ── Missing items (Returned Incomplete jobs → MissingDamaged) ──────────────
+// For every job HireHop reports as Returned Incomplete (status 6) we read the
+// check-in list (the same call HireHop's "Check job in..." screen makes) and
+// log each short line as a "Missing" row: item title + quantity not returned.
+//   • TYPE 2 = hire stock, TYPE 3 = custom items → checked. TYPE 1 = sales /
+//     consumables (tape etc.) → ignored, they're never expected back.
+//   • Rows are keyed on (job_number, hh_list_id), so re-runs update, not dupe.
+//   • Only rows still at status "Identified" are touched by the sync. Once
+//     someone moves a row on (Informed, Accepted, …) the sync leaves it alone.
+//   • If an Identified row's item later gets checked in (or the job leaves
+//     Returned Incomplete with nothing short), it's closed as "Rectified".
+const MD_TABLE          = "MissingDamaged";
+const MD_CHECK_TYPES    = new Set([2, 3]);
+const RETURNED_INCOMPLETE = "6";
+
+function uaeToday() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Dubai" }).format(new Date());
+}
+
+async function fetchCheckInList(jar, jobId) {
+  const url = `${HIREHOP_BASE}/modules/scanning/get_check_in_list.php?main_id=${encodeURIComponent(jobId)}&kind=3`;
+  const res = await fetch(url, {
+    headers: { "accept": "application/json", "x-requested-with": "XMLHttpRequest",
+               "referer": `${HIREHOP_BASE}/job.php?id=${jobId}`, "cookie": cookieStr(jar) },
+  });
+  const text = await res.text();
+  if (res.status !== 200) throw new Error(`check-in list HTTP ${res.status}`);
+  const data = JSON.parse(text);
+  if (data.error) throw new Error(`HireHop error: ${data.error}`);
+  if (!Array.isArray(data.rows)) throw new Error("Unexpected check-in list shape");
+  return data.rows;
+}
+
+function appendComment(existing, text) {
+  const arr = Array.isArray(existing) ? existing : [];
+  return [...arr, { ts: new Date().toISOString(), user: "HireHop sync", text }].slice(-5);
+}
+
+async function syncMissingItems(jar, reportRows) {
+  console.log(`\nSyncing missing items (${MD_TABLE})...`);
+  const s = { jobs: 0, inserted: 0, updated: 0, closed: 0, failed: 0 };
+
+  // Jobs currently Returned Incomplete in HireHop → company lookup
+  const riJobs = new Map();
+  for (const row of reportRows) {
+    if (String(row.STATUS) === RETURNED_INCOMPLETE && row.JOB_ID) {
+      riJobs.set(String(row.JOB_ID).trim(), row.COMPANY ?? null);
+    }
+  }
+
+  // Open auto-rows (so items on jobs that have since left Returned Incomplete get closed)
+  const open = await sbRequest("GET",
+    `/${MD_TABLE}?hh_list_id=not.is.null&status=eq.Identified&select=id,job_number,hh_list_id,quantity,memo,Comments`);
+  const openByJob = new Map();
+  for (const r of open || []) {
+    if (!openByJob.has(r.job_number)) openByJob.set(r.job_number, []);
+    openByJob.get(r.job_number).push(r);
+  }
+
+  const jobIds = new Set([...riJobs.keys(), ...openByJob.keys()]);
+  for (const jobId of jobIds) {
+    s.jobs++;
+    try {
+      const short = new Map(); // LIST_ID → row
+      if (riJobs.has(jobId)) {
+        const rows = await fetchCheckInList(jar, jobId);
+        for (const r of rows) {
+          if (MD_CHECK_TYPES.has(Number(r.TYPE)) && Number(r.remain) > 0) short.set(String(r.LIST_ID), r);
+        }
+      }
+
+      // All auto-rows for this job (any status) so we never re-create one staff have moved on
+      const existing = await sbRequest("GET",
+        `/${MD_TABLE}?job_number=eq.${encodeURIComponent(jobId)}&hh_list_id=not.is.null&select=id,hh_list_id,status,quantity,memo,Comments`);
+      const byList = new Map((existing || []).map(r => [String(r.hh_list_id), r]));
+
+      for (const [listId, r] of short) {
+        const qty  = Number(r.remain);
+        const memo = `${qty} of ${Number(r.ordered)} not returned (HireHop check-in)`;
+        const ex   = byList.get(listId);
+        if (!ex) {
+          await sbRequest("POST", `/${MD_TABLE}`, {
+            type: "Missing", date: uaeToday(), status: "Identified",
+            job_number: jobId, company: riJobs.get(jobId) ?? null,
+            title: String(r.TITLE || "").trim() || null,
+            quantity: qty, hh_list_id: Number(listId), memo,
+            created_by: "HireHop sync",
+            Comments: [],
+          });
+          s.inserted++;
+        } else if (ex.status === "Identified" && Number(ex.quantity) !== qty) {
+          await sbRequest("PATCH", `/${MD_TABLE}?id=eq.${ex.id}`, {
+            quantity: qty, memo, updated_at: new Date().toISOString(),
+          });
+          s.updated++;
+        }
+      }
+
+      // Identified auto-rows whose item is no longer short → Rectified
+      for (const ex of existing || []) {
+        if (ex.status !== "Identified" || short.has(String(ex.hh_list_id))) continue;
+        await sbRequest("PATCH", `/${MD_TABLE}?id=eq.${ex.id}`, {
+          status: "Rectified",
+          Comments: appendComment(ex.Comments, "Checked back in on HireHop — closed automatically"),
+          updated_at: new Date().toISOString(),
+        });
+        s.closed++;
+      }
+    } catch (e) {
+      s.failed++;
+      console.error(`  ❌ Missing items, job ${jobId}:`, e.message);
+      await sbReportSyncError(e.message, `Missing items — job ${jobId}`);
+    }
+  }
+
+  console.log(`  Jobs checked: ${s.jobs}, new: ${s.inserted}, updated: ${s.updated}, closed: ${s.closed}, failed: ${s.failed}`);
+  return s;
+}
+
 // ── Canonical value for change detection (mirrors jCanonicalUploadValue) ───
 function canonical(v, col) {
   if (v == null) return "";
@@ -411,6 +530,14 @@ async function main() {
       console.error(`  ❌ Job ${jobId}:`, e.message);
       await sbReportSyncError(e.message, `Job ${jobId}`);
     }
+  }
+
+  // 2b. Missing items on Returned Incomplete jobs (own try so it can never break the Jobs sync)
+  try {
+    await syncMissingItems(jar, rows);
+  } catch (e) {
+    console.error("  ❌ Missing items sync:", e.message);
+    await sbReportSyncError(e.message, "Missing items sync");
   }
 
   // 3. If there were row-level failures, write one summary error to SyncErrors
