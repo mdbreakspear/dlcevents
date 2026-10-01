@@ -347,13 +347,16 @@ async function sbWriteSyncRun(status, detail) {
 //   • TYPE 2 = hire stock, TYPE 3 = custom items → checked. TYPE 1 = sales /
 //     consumables (tape etc.) → ignored, they're never expected back.
 //   • Rows are keyed on (job_number, hh_list_id), so re-runs update, not dupe.
-//   • Only rows still at status "Identified" are touched by the sync. Once
-//     someone moves a row on (Informed, Accepted, …) the sync leaves it alone.
-//   • If an Identified row's item later gets checked in (or the job leaves
-//     Returned Incomplete with nothing short), it's closed as "Rectified".
+//   • Rows at an "open" status (Identified, Informed, Accepted, Dispute) are
+//     tracked: quantity follows HireHop, and if the item later gets checked in
+//     (or the job leaves Returned Incomplete with nothing short) the row is
+//     closed as "Rectified". Invoiced / Paid / Rectified rows are never touched,
+//     since money has changed hands or the line is already closed.
 const MD_TABLE          = "MissingDamaged";
 const MD_CHECK_TYPES    = new Set([2, 3]);
 const RETURNED_INCOMPLETE = "6";
+const MD_OPEN_STATUSES  = ["Identified", "Informed", "Accepted", "Dispute"];
+const mdIsOpen = st => MD_OPEN_STATUSES.includes(st);
 
 function uaeToday() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Dubai" }).format(new Date());
@@ -392,7 +395,7 @@ async function syncMissingItems(jar, reportRows) {
 
   // Open auto-rows (so items on jobs that have since left Returned Incomplete get closed)
   const open = await sbRequest("GET",
-    `/${MD_TABLE}?hh_list_id=not.is.null&status=eq.Identified&select=id,job_number,hh_list_id,quantity,memo,Comments`);
+    `/${MD_TABLE}?hh_list_id=not.is.null&status=in.(${MD_OPEN_STATUSES.join(",")})&select=id,job_number,hh_list_id,quantity,memo,Comments`);
   const openByJob = new Map();
   for (const r of open || []) {
     if (!openByJob.has(r.job_number)) openByJob.set(r.job_number, []);
@@ -403,12 +406,12 @@ async function syncMissingItems(jar, reportRows) {
   for (const jobId of jobIds) {
     s.jobs++;
     try {
+      // Always read the real check-in list — only close a line when HireHop
+      // shows the item actually back, never just because the job status moved.
       const short = new Map(); // LIST_ID → row
-      if (riJobs.has(jobId)) {
-        const rows = await fetchCheckInList(jar, jobId);
-        for (const r of rows) {
-          if (MD_CHECK_TYPES.has(Number(r.TYPE)) && Number(r.remain) > 0) short.set(String(r.LIST_ID), r);
-        }
+      const rows = await fetchCheckInList(jar, jobId);
+      for (const r of rows) {
+        if (MD_CHECK_TYPES.has(Number(r.TYPE)) && Number(r.remain) > 0) short.set(String(r.LIST_ID), r);
       }
 
       // All auto-rows for this job (any status) so we never re-create one staff have moved on
@@ -421,6 +424,7 @@ async function syncMissingItems(jar, reportRows) {
         const memo = `${qty} of ${Number(r.ordered)} not returned (HireHop check-in)`;
         const ex   = byList.get(listId);
         if (!ex) {
+          if (!riJobs.has(jobId)) continue; // only log new lines while job is Returned Incomplete
           await sbRequest("POST", `/${MD_TABLE}`, {
             type: "Missing", date: uaeToday(), status: "Identified",
             job_number: jobId, company: riJobs.get(jobId) ?? null,
@@ -430,17 +434,20 @@ async function syncMissingItems(jar, reportRows) {
             Comments: [],
           });
           s.inserted++;
-        } else if (ex.status === "Identified" && Number(ex.quantity) !== qty) {
-          await sbRequest("PATCH", `/${MD_TABLE}?id=eq.${ex.id}`, {
-            quantity: qty, memo, updated_at: new Date().toISOString(),
-          });
+        } else if (mdIsOpen(ex.status) && Number(ex.quantity) !== qty) {
+          const patch = { quantity: qty, memo, updated_at: new Date().toISOString() };
+          // Staff are already working this line — leave a trail of the change
+          if (ex.status !== "Identified") {
+            patch.Comments = appendComment(ex.Comments, `HireHop quantity changed ${ex.quantity} → ${qty}`);
+          }
+          await sbRequest("PATCH", `/${MD_TABLE}?id=eq.${ex.id}`, patch);
           s.updated++;
         }
       }
 
-      // Identified auto-rows whose item is no longer short → Rectified
+      // Open auto-rows whose item is no longer short → Rectified
       for (const ex of existing || []) {
-        if (ex.status !== "Identified" || short.has(String(ex.hh_list_id))) continue;
+        if (!mdIsOpen(ex.status) || short.has(String(ex.hh_list_id))) continue;
         await sbRequest("PATCH", `/${MD_TABLE}?id=eq.${ex.id}`, {
           status: "Rectified",
           Comments: appendComment(ex.Comments, "Checked back in on HireHop — closed automatically"),
