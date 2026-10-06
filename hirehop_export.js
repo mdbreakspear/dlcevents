@@ -350,13 +350,18 @@ async function sbWriteSyncRun(status, detail) {
 //   • Rows at an "open" status (Identified, Informed, Accepted, Dispute) are
 //     tracked: quantity follows HireHop, and if the item later gets checked in
 //     (or the job leaves Returned Incomplete with nothing short) the row is
-//     closed as "Rectified". Invoiced / Paid / Rectified rows are never touched,
-//     since money has changed hands or the line is already closed.
+//     closed as "Rectified". Paid / Rectified rows are never touched, since
+//     money has changed hands or the line is already closed.
+//   • Invoiced rows keep their status, but when the item is checked back in
+//     they are flagged once: hh_returned_at is stamped and a comment added so
+//     staff can check whether a credit is due (CRM shows the row green with a
+//     "Returned" pill).
 const MD_TABLE          = "MissingDamaged";
 const MD_CHECK_TYPES    = new Set([2, 3]);
 const RETURNED_INCOMPLETE = "6";
 const MD_OPEN_STATUSES  = ["Identified", "Informed", "Accepted", "Dispute"];
 const mdIsOpen = st => MD_OPEN_STATUSES.includes(st);
+const MD_RETURNED_COMMENT = "Returned on HireHop: check whether a credit is due";
 
 function uaeToday() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Dubai" }).format(new Date());
@@ -383,7 +388,7 @@ function appendComment(existing, text) {
 
 async function syncMissingItems(jar, reportRows) {
   console.log(`\nSyncing missing items (${MD_TABLE})...`);
-  const s = { jobs: 0, inserted: 0, updated: 0, closed: 0, failed: 0 };
+  const s = { jobs: 0, inserted: 0, updated: 0, closed: 0, returned: 0, failed: 0 };
 
   // Jobs currently Returned Incomplete in HireHop → company lookup
   const riJobs = new Map();
@@ -402,7 +407,12 @@ async function syncMissingItems(jar, reportRows) {
     openByJob.get(r.job_number).push(r);
   }
 
-  const jobIds = new Set([...riJobs.keys(), ...openByJob.keys()]);
+  // Invoiced auto-rows not yet flagged as returned → keep watching their jobs
+  const invoiced = await sbRequest("GET",
+    `/${MD_TABLE}?hh_list_id=not.is.null&status=eq.Invoiced&hh_returned_at=is.null&select=job_number`);
+  const invoicedJobs = (invoiced || []).map(r => r.job_number).filter(Boolean);
+
+  const jobIds = new Set([...riJobs.keys(), ...openByJob.keys(), ...invoicedJobs]);
   for (const jobId of jobIds) {
     s.jobs++;
     try {
@@ -416,7 +426,7 @@ async function syncMissingItems(jar, reportRows) {
 
       // All auto-rows for this job (any status) so we never re-create one staff have moved on
       const existing = await sbRequest("GET",
-        `/${MD_TABLE}?job_number=eq.${encodeURIComponent(jobId)}&hh_list_id=not.is.null&select=id,hh_list_id,status,quantity,memo,Comments`);
+        `/${MD_TABLE}?job_number=eq.${encodeURIComponent(jobId)}&hh_list_id=not.is.null&select=id,hh_list_id,status,quantity,memo,Comments,hh_returned_at`);
       const byList = new Map((existing || []).map(r => [String(r.hh_list_id), r]));
 
       for (const [listId, r] of short) {
@@ -455,6 +465,17 @@ async function syncMissingItems(jar, reportRows) {
         });
         s.closed++;
       }
+
+      // Invoiced auto-rows whose item is now back → flag once, status untouched
+      for (const ex of existing || []) {
+        if (ex.status !== "Invoiced" || ex.hh_returned_at || short.has(String(ex.hh_list_id))) continue;
+        await sbRequest("PATCH", `/${MD_TABLE}?id=eq.${ex.id}`, {
+          hh_returned_at: new Date().toISOString(),
+          Comments: appendComment(ex.Comments, MD_RETURNED_COMMENT),
+          updated_at: new Date().toISOString(),
+        });
+        s.returned++;
+      }
     } catch (e) {
       s.failed++;
       console.error(`  ❌ Missing items, job ${jobId}:`, e.message);
@@ -462,7 +483,7 @@ async function syncMissingItems(jar, reportRows) {
     }
   }
 
-  console.log(`  Jobs checked: ${s.jobs}, new: ${s.inserted}, updated: ${s.updated}, closed: ${s.closed}, failed: ${s.failed}`);
+  console.log(`  Jobs checked: ${s.jobs}, new: ${s.inserted}, updated: ${s.updated}, closed: ${s.closed}, returned (invoiced): ${s.returned}, failed: ${s.failed}`);
   return s;
 }
 
