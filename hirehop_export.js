@@ -7,6 +7,11 @@
  * 3. Transforms data exactly as the HTML upload function does
  * 4. Upserts into Supabase Jobs table (insert new, update changed, skip unchanged)
  *
+ * Supabase traffic is batched: Jobs and JobCostings are each read ONCE per run,
+ * compared in memory, and only new/changed rows are written back in a single
+ * upsert per table. An idle run is 2 reads + the SyncRuns record, instead of
+ * 2-3 requests per job (which was ~100k logged API requests a day).
+ *
  * Usage:    node hirehop_export.js
  * Schedule: Windows Task Scheduler → node C:\path\to\hirehop_export.js
  */
@@ -217,14 +222,14 @@ function transformRow(row) {
 }
 
 // ── Supabase helpers ───────────────────────────────────────────────────────
-async function sbRequest(method, path, body) {
+async function sbRequest(method, path, body, prefer) {
   const res = await fetch(`${SB_URL}/rest/v1${path}`, {
     method,
     headers: {
       "apikey":        SB_KEY,
       "Authorization": `Bearer ${SB_KEY}`,
       "Content-Type":  "application/json",
-      "Prefer":        method === "POST" ? "return=representation" : "return=representation",
+      "Prefer":        prefer || "return=representation",
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -235,17 +240,46 @@ async function sbRequest(method, path, body) {
   return data;
 }
 
-async function sbFindJob(jobId) {
-  const data = await sbRequest("GET", `/${J_TABLE}?Job=eq.${encodeURIComponent(jobId)}&limit=1`);
-  return (Array.isArray(data) && data.length) ? data[0] : null;
+// Read a whole table in pages (PostgREST caps a response at 1000 rows), ordered
+// by the unique "Job" column so paging is stable.
+const SB_PAGE = 1000;
+async function sbFetchAll(table, select) {
+  const out = [];
+  for (let offset = 0; ; offset += SB_PAGE) {
+    const page = await sbRequest("GET",
+      `/${table}?select=${encodeURIComponent(select)}&order=Job.asc&limit=${SB_PAGE}&offset=${offset}`);
+    if (!Array.isArray(page)) throw new Error(`Unexpected response reading ${table}`);
+    out.push(...page);
+    if (page.length < SB_PAGE) break;
+  }
+  return out;
 }
 
-async function sbInsert(payload) {
-  return sbRequest("POST", `/${J_TABLE}`, payload);
+// Insert-or-update many rows in ONE request, matched on the unique "Job" column.
+// Only the columns present in the rows are written; every row in a batch must
+// carry the same keys (PostgREST nulls out columns that some rows omit).
+async function sbUpsert(table, rows) {
+  if (!rows.length) return;
+  await sbRequest("POST", `/${table}?on_conflict=Job`, rows,
+    "resolution=merge-duplicates,return=minimal");
 }
 
-async function sbUpdate(jobId, payload) {
-  return sbRequest("PATCH", `/${J_TABLE}?Job=eq.${encodeURIComponent(jobId)}`, payload);
+// Write a batch; if the batch is rejected, retry row by row so one bad row
+// cannot block the rest. Returns the rows that still failed, with the error.
+async function sbUpsertBatch(table, rows) {
+  if (!rows.length) return [];
+  try {
+    await sbUpsert(table, rows);
+    return [];
+  } catch (batchErr) {
+    console.warn(`  ⚠ ${table} batch upsert failed (${batchErr.message}) — retrying row by row`);
+    const failed = [];
+    for (const row of rows) {
+      try { await sbUpsert(table, [row]); }
+      catch (e) { failed.push({ row, error: e }); }
+    }
+    return failed;
+  }
 }
 
 // ── JobCostings (HireHop "Known Job Costs" custom field) ───────────────────
@@ -261,53 +295,48 @@ function parseJobCosts(row) {
   return Number.isFinite(n) ? n : null;
 }
 
-// Look up the existing costing row for a job (Job Cost only — that's all the
-// fill decision needs).
-async function sbFindCosting(jobId) {
-  const data = await sbRequest(
-    "GET",
-    `/${JC_TABLE}?Job=eq.${encodeURIComponent(jobId)}&select=Job,"Job Cost"&limit=1`
-  );
-  return (Array.isArray(data) && data.length) ? data[0] : null;
-}
-
 // Fill rule (a): HireHop is a FALLBACK cost source, never authoritative.
 // Write the HireHop JobCosts value only when the existing Job Cost is null OR 0
 // (i.e. no real Xero cost is present). A non-zero existing cost — which would
 // have come from a Xero Project Financials import — is left untouched.
 // Profit = Total − JobCosts. Applies to all job types.
-async function syncCosting(row, payload, summary) {
+//
+// `existing` is this job's row from the single JobCostings read (or undefined).
+// Returns the row to upsert, or null when nothing needs writing — including
+// when the stored Job Cost and Profit already match, so an unchanged job is no
+// longer re-written on every run.
+const sameMoney = (a, b) =>
+  a !== null && a !== undefined && Number.isFinite(Number(a)) && Math.abs(Number(a) - b) < 0.005;
+
+function planCosting(row, payload, existing, summary) {
   const jobId    = payload["Job"];
   const jobCosts = parseJobCosts(row);
-  if (jobCosts === null) { summary.costSkipped++; return; }   // HireHop has no value → do nothing
+  if (jobCosts === null) { summary.costSkipped++; return null; }   // HireHop has no value → do nothing
 
   // Total from the same report row (already mapped into the Jobs payload).
   const totalNum = parseFloat(String(payload["Total"] ?? "").replace(/,/g, "").trim());
   const total    = Number.isFinite(totalNum) ? totalNum : 0;
-  const profit   = total - jobCosts;
+  const profit   = Number((total - jobCosts).toFixed(2));
 
-  const existing    = await sbFindCosting(jobId);
   const existingCost = existing && existing["Job Cost"] !== null && existing["Job Cost"] !== undefined
     ? Number(existing["Job Cost"]) : null;
 
   // Only fill when existing cost is null or exactly 0.
-  if (existingCost !== null && existingCost !== 0) { summary.costPreserved++; return; }
+  if (existingCost !== null && existingCost !== 0) { summary.costPreserved++; return null; }
 
-  const nowIso = new Date().toISOString();
-  const body = {
+  // Already holds exactly what we would write → nothing to do.
+  if (existing && sameMoney(existing["Job Cost"], jobCosts) && sameMoney(existing["Profit"], profit)) {
+    summary.costUnchanged++;
+    return null;
+  }
+
+  return {
     Job:        jobId,
     "Job Cost": jobCosts,
     "Profit":   profit,
-    updated_at: nowIso,
+    updated_at: new Date().toISOString(),
     updated_by: "HireHop sync",
   };
-
-  if (existing) {
-    await sbRequest("PATCH", `/${JC_TABLE}?Job=eq.${encodeURIComponent(jobId)}`, body);
-  } else {
-    await sbRequest("POST", `/${JC_TABLE}`, body);
-  }
-  summary.costWritten++;
 }
 
 // Write a row to SyncErrors so the CRM notifications panel can surface it.
@@ -523,42 +552,64 @@ async function main() {
   console.log(`\nFetching report: ${from} → ${upto}`);
   const rows           = await fetchReport(jar, from, upto);
 
-  // 2. Sync to Supabase
+  // 2. Sync to Supabase — one read per table, compare in memory, one write per table
   console.log(`\nSyncing to Supabase (${J_TABLE})...`);
   const summary = { inserted: 0, updated: 0, unchanged: 0, skipped: 0, failed: 0,
-                    costWritten: 0, costPreserved: 0, costSkipped: 0, errors: [] };
+                    costWritten: 0, costPreserved: 0, costSkipped: 0, costUnchanged: 0, errors: [] };
 
+  // De-duplicate the report on Job (last row wins, as the old row-by-row loop
+  // did) — an upsert batch may not touch the same row twice.
+  const wanted = new Map();   // jobId → { row, payload }
   for (const row of rows) {
     const payload = transformRow(row);
     const jobId   = payload["Job"];
-
     // Skip rows with no Company or Job ID (mirrors HTML logic)
     if (!jobId || !payload["Company"]) { summary.skipped++; continue; }
-
-    try {
-      const existing = await sbFindJob(jobId);
-
-      if (existing) {
-        if (hasChanges(existing, payload)) {
-          await sbUpdate(jobId, payload);
-          summary.updated++;
-        } else {
-          summary.unchanged++;
-        }
-      } else {
-        await sbInsert(payload);
-        summary.inserted++;
-      }
-
-      // JobCostings fallback fill (HireHop "Known Job Costs" → Job Cost / Profit).
-      await syncCosting(row, payload, summary);
-    } catch(e) {
-      summary.failed++;
-      summary.errors.push(`Job ${jobId}: ${e.message}`);
-      console.error(`  ❌ Job ${jobId}:`, e.message);
-      await sbReportSyncError(e.message, `Job ${jobId}`);
-    }
+    payload["Job"] = String(jobId);   // "Job" is a text column — keep keys uniform
+    wanted.set(payload["Job"], { row, payload });
   }
+
+  const [existingJobs, existingCostings] = await Promise.all([
+    sbFetchAll(J_TABLE, "*"),
+    sbFetchAll(JC_TABLE, 'Job,"Job Cost",Profit'),
+  ]);
+  const jobsByNo     = new Map(existingJobs.map(j => [String(j.Job), j]));
+  const costingsByNo = new Map(existingCostings.map(c => [String(c.Job), c]));
+  console.log(`  Read ${existingJobs.length} jobs and ${existingCostings.length} costings from Supabase`);
+
+  const jobWrites = [], costWrites = [];
+  const newJobs = new Set();
+  for (const [jobId, { row, payload }] of wanted) {
+    const existing = jobsByNo.get(jobId);
+    if (!existing) { jobWrites.push(payload); newJobs.add(jobId); }
+    else if (hasChanges(existing, payload)) jobWrites.push(payload);
+    else summary.unchanged++;
+
+    // JobCostings fallback fill (HireHop "Known Job Costs" → Job Cost / Profit).
+    const costing = planCosting(row, payload, costingsByNo.get(jobId), summary);
+    if (costing) costWrites.push(costing);
+  }
+
+  const noteFailures = async (failures, label) => {
+    for (const { row, error } of failures) {
+      summary.failed++;
+      summary.errors.push(`${label} ${row.Job}: ${error.message}`);
+      console.error(`  ❌ ${label} ${row.Job}:`, error.message);
+      await sbReportSyncError(error.message, `${label} ${row.Job}`);
+    }
+  };
+
+  const jobFailures = await sbUpsertBatch(J_TABLE, jobWrites);
+  const failedJobs  = new Set(jobFailures.map(f => f.row.Job));
+  for (const p of jobWrites) {
+    if (failedJobs.has(p.Job)) continue;
+    if (newJobs.has(p.Job)) summary.inserted++; else summary.updated++;
+  }
+  await noteFailures(jobFailures, "Job");
+
+  const costFailures = await sbUpsertBatch(JC_TABLE, costWrites);
+  summary.costWritten = costWrites.length - costFailures.length;
+  await noteFailures(costFailures, "Job costing");
 
   // 2b. Missing items on Returned Incomplete jobs (own try so it can never break the Jobs sync)
   try {
@@ -585,6 +636,7 @@ async function main() {
   console.log(`  Failed:    ${summary.failed}`);
   console.log(`  Costs written:   ${summary.costWritten}`);
   console.log(`  Costs preserved: ${summary.costPreserved} (existing non-zero left intact)`);
+  console.log(`  Costs unchanged: ${summary.costUnchanged} (already up to date)`);
   console.log(`  Costs skipped:   ${summary.costSkipped} (no HireHop value)`);
   if (summary.errors.length) {
     console.log("\nErrors:");
