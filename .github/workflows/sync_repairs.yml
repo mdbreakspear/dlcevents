@@ -22,6 +22,7 @@ jobs:
         env:
           HIREHOP_EMAIL: ${{ secrets.HIREHOP_EMAIL }}
           HIREHOP_PASS: ${{ secrets.HIREHOP_PASS }}
+          HIREHOP_TOKEN: ${{ secrets.HIREHOP_TOKEN }}
           SB_URL: ${{ secrets.SB_URL }}
           SB_KEY: ${{ secrets.SB_KEY }}
         run: node hirehop_repairs_export.js

@@ -22,3 +22,4 @@ jobs:
           SB_URL: ${{ secrets.SB_URL }}
           HIREHOP_PASS: ${{ secrets.HIREHOP_PASS }}
           HIREHOP_EMAIL: ${{ secrets.HIREHOP_EMAIL }}
+          HIREHOP_TOKEN: ${{ secrets.HIREHOP_TOKEN }}
