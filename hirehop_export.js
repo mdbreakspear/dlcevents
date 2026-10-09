@@ -2,7 +2,7 @@
 /**
  * HireHop → Supabase Jobs Sync
  * -----------------------------
- * 1. Logs in to HireHop (2-step)
+ * 1. Authenticates to HireHop with the API token (password login only as fallback)
  * 2. Fetches the Job Income report (1st of previous month → 2040-01-01)
  * 3. Transforms data exactly as the HTML upload function does
  * 4. Upserts into Supabase Jobs table (insert new, update changed, skip unchanged)
@@ -24,6 +24,7 @@ const HIREHOP_BASE   = "https://myhirehop.com";
 const HIREHOP_CO     = "DEFTR";
 const HIREHOP_EMAIL  = process.env.HIREHOP_EMAIL || "lorraine@dlcevents.com";
 const HIREHOP_PASS   = process.env.HIREHOP_PASS;
+const HIREHOP_TOKEN  = (process.env.HIREHOP_TOKEN || "").trim();
 const HIREHOP_DEPOT  = [2];
 const HIREHOP_STATUS = ["0","0.5","1","2","2.5","3","4","5","5.5","6","7","8","9",
                         "10","10.1","10.2","10.3","10.4","10.5","10.6","11"];
@@ -130,18 +131,52 @@ async function login() {
   return jar;
 }
 
+// ── HireHop auth ───────────────────────────────────────────────────────────
+// Preferred: the API token (HIREHOP_TOKEN), sent as token= on every request.
+// A HireHop token is cancelled the moment its user logs in, so while the token
+// works this script must NOT log in — that is what used to break the CRM's
+// "Change Status" and contact-push buttons, which share the same token.
+// The password login is kept only as a fallback: if HireHop refuses the token,
+// the run logs in instead so the sync never stops (and says so in SyncRuns).
+const hhAuth = { mode: HIREHOP_TOKEN ? "token" : "login", jar: null, fellBack: false };
+const HH_AUTH_ERR = /logged out|log ?in|token/i;
+
+async function hhGet(url, referer) {
+  for (;;) {
+    if (hhAuth.mode === "login" && !hhAuth.jar) hhAuth.jar = await login();
+    const full = hhAuth.mode === "token"
+      ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(HIREHOP_TOKEN)
+      : url;
+    const headers = { "accept": "application/json", "x-requested-with": "XMLHttpRequest", "referer": referer };
+    if (hhAuth.mode === "login") headers["cookie"] = cookieStr(hhAuth.jar);
+    const res  = await fetch(full, { headers });
+    const text = await res.text();
+
+    if (hhAuth.mode === "token") {
+      let refused = res.status === 401 || res.status === 403 || text.trim().startsWith("<");
+      if (!refused) {
+        try { const d = JSON.parse(text); refused = !!(d && d.error && HH_AUTH_ERR.test(String(d.error))); } catch (_) {}
+      }
+      if (refused) {
+        if (!HIREHOP_PASS) throw new Error("HireHop refused the API token (HIREHOP_TOKEN) and no password login is configured");
+        console.warn("  ⚠ HireHop refused the API token — falling back to password login for this run");
+        hhAuth.mode = "login"; hhAuth.fellBack = true;
+        continue;
+      }
+    }
+    return { res, text };
+  }
+}
+const hhAuthNote = () => hhAuth.fellBack ? " · HireHop API token refused, used password login" : "";
+
 // ── Fetch HireHop report ───────────────────────────────────────────────────
-async function fetchReport(jar, from, upto) {
+async function fetchReport(from, upto) {
   const url = `${HIREHOP_BASE}/reports/job_income_list.php`
     + `?from=${from}&upto=${upto}`
     + `&status=${encodeURIComponent(JSON.stringify(HIREHOP_STATUS))}`
     + `&depot=${encodeURIComponent(JSON.stringify(HIREHOP_DEPOT))}`;
 
-  const res  = await fetch(url, {
-    headers: { "accept": "application/json", "x-requested-with": "XMLHttpRequest",
-               "referer": `${HIREHOP_BASE}/reports/job_income.php`, "cookie": cookieStr(jar) }
-  });
-  const text = await res.text();
+  const { res, text } = await hhGet(url, `${HIREHOP_BASE}/reports/job_income.php`);
   if (res.status !== 200) throw new Error(`HTTP ${res.status}: ${text.slice(0,200)}`);
 
   const data = JSON.parse(text);
@@ -396,13 +431,9 @@ function uaeToday() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Dubai" }).format(new Date());
 }
 
-async function fetchCheckInList(jar, jobId) {
+async function fetchCheckInList(jobId) {
   const url = `${HIREHOP_BASE}/modules/scanning/get_check_in_list.php?main_id=${encodeURIComponent(jobId)}&kind=3`;
-  const res = await fetch(url, {
-    headers: { "accept": "application/json", "x-requested-with": "XMLHttpRequest",
-               "referer": `${HIREHOP_BASE}/job.php?id=${jobId}`, "cookie": cookieStr(jar) },
-  });
-  const text = await res.text();
+  const { res, text } = await hhGet(url, `${HIREHOP_BASE}/job.php?id=${jobId}`);
   if (res.status !== 200) throw new Error(`check-in list HTTP ${res.status}`);
   const data = JSON.parse(text);
   if (data.error) throw new Error(`HireHop error: ${data.error}`);
@@ -415,7 +446,7 @@ function appendComment(existing, text) {
   return [...arr, { ts: new Date().toISOString(), user: "HireHop sync", text }].slice(-5);
 }
 
-async function syncMissingItems(jar, reportRows) {
+async function syncMissingItems(reportRows) {
   console.log(`\nSyncing missing items (${MD_TABLE})...`);
   const s = { jobs: 0, inserted: 0, updated: 0, closed: 0, returned: 0, failed: 0 };
 
@@ -448,7 +479,7 @@ async function syncMissingItems(jar, reportRows) {
       // Always read the real check-in list — only close a line when HireHop
       // shows the item actually back, never just because the job status moved.
       const short = new Map(); // LIST_ID → row
-      const rows = await fetchCheckInList(jar, jobId);
+      const rows = await fetchCheckInList(jobId);
       for (const r of rows) {
         if (MD_CHECK_TYPES.has(Number(r.TYPE)) && Number(r.remain) > 0) short.set(String(r.LIST_ID), r);
       }
@@ -546,11 +577,11 @@ function hasChanges(existing, payload) {
 async function main() {
   console.log("=== HireHop → Supabase Sync ===\n");
 
-  // 1. Login + fetch
-  const jar            = await login();
+  // 1. Authenticate + fetch (API token; password login only if the token is refused)
+  console.log(`HireHop auth: ${hhAuth.mode === "token" ? "API token" : "password login (no HIREHOP_TOKEN set)"}`);
   const { from, upto } = getDateRange();
   console.log(`\nFetching report: ${from} → ${upto}`);
-  const rows           = await fetchReport(jar, from, upto);
+  const rows           = await fetchReport(from, upto);
 
   // 2. Sync to Supabase — one read per table, compare in memory, one write per table
   console.log(`\nSyncing to Supabase (${J_TABLE})...`);
@@ -613,7 +644,7 @@ async function main() {
 
   // 2b. Missing items on Returned Incomplete jobs (own try so it can never break the Jobs sync)
   try {
-    await syncMissingItems(jar, rows);
+    await syncMissingItems(rows);
   } catch (e) {
     console.error("  ❌ Missing items sync:", e.message);
     await sbReportSyncError(e.message, "Missing items sync");
@@ -647,7 +678,7 @@ async function main() {
   await sbWriteSyncRun(
     summary.failed === 0 ? "success" : "partial",
     summary.failed === 0
-      ? `${summary.inserted} inserted, ${summary.updated} updated, ${summary.unchanged} unchanged`
+      ? `${summary.inserted} inserted, ${summary.updated} updated, ${summary.unchanged} unchanged${hhAuthNote()}`
       : `${summary.failed} failed. ${summary.errors[0] || ''}`
   );
 

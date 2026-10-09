@@ -13,20 +13,21 @@
  *   - Items that reappear in HireHop → PATCH archived = 'Current'.
  *
  * Required GitHub Secrets:
- *   HIREHOP_EMAIL, HIREHOP_PASS, SB_URL, SB_KEY
+ *   HIREHOP_TOKEN (preferred), HIREHOP_EMAIL + HIREHOP_PASS (fallback), SB_URL, SB_KEY
  */
 
 const HIREHOP_BASE  = "https://myhirehop.com";
 const HIREHOP_CO    = "DEFTR";
 const HIREHOP_EMAIL = process.env.HIREHOP_EMAIL;
 const HIREHOP_PASS  = process.env.HIREHOP_PASS;
+const HIREHOP_TOKEN = (process.env.HIREHOP_TOKEN || "").trim();
 const HIREHOP_DEPOT = [2];
 
 const SB_URL    = process.env.SB_URL;
 const SB_KEY    = process.env.SB_KEY;
 const REP_TABLE = "Repairs";
 
-if (!HIREHOP_EMAIL || !HIREHOP_PASS) throw new Error("Missing HIREHOP_EMAIL or HIREHOP_PASS secret");
+if (!HIREHOP_TOKEN && (!HIREHOP_EMAIL || !HIREHOP_PASS)) throw new Error("Missing HIREHOP_TOKEN (or HIREHOP_EMAIL + HIREHOP_PASS) secret");
 if (!SB_URL || !SB_KEY)             throw new Error("Missing SB_URL or SB_KEY secret");
 
 const STATUS_MAP = { "1.0": "Flagged", "2.0": "In repair" };
@@ -68,19 +69,53 @@ async function login() {
   return jar;
 }
 
+// ── HireHop auth ───────────────────────────────────────────────────────────
+// Preferred: the API token (HIREHOP_TOKEN), sent as token= on every request.
+// A HireHop token is cancelled the moment its user logs in, so while the token
+// works this script must NOT log in — that is what used to break the CRM's
+// "Change Status" and contact-push buttons, which share the same token.
+// The password login is kept only as a fallback: if HireHop refuses the token,
+// the run logs in instead so the sync never stops (and says so in SyncRuns).
+const hhAuth = { mode: HIREHOP_TOKEN ? "token" : "login", jar: null, fellBack: false };
+const HH_AUTH_ERR = /logged out|log ?in|token/i;
+
+async function hhGet(url, referer) {
+  for (;;) {
+    if (hhAuth.mode === "login" && !hhAuth.jar) hhAuth.jar = await login();
+    const full = hhAuth.mode === "token"
+      ? url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(HIREHOP_TOKEN)
+      : url;
+    const headers = { "accept": "application/json", "x-requested-with": "XMLHttpRequest", "referer": referer };
+    if (hhAuth.mode === "login") headers["cookie"] = cookieStr(hhAuth.jar);
+    const res  = await fetch(full, { headers });
+    const text = await res.text();
+
+    if (hhAuth.mode === "token") {
+      let refused = res.status === 401 || res.status === 403 || text.trim().startsWith("<");
+      if (!refused) {
+        try { const d = JSON.parse(text); refused = !!(d && d.error && HH_AUTH_ERR.test(String(d.error))); } catch (_) {}
+      }
+      if (refused) {
+        if (!HIREHOP_PASS) throw new Error("HireHop refused the API token (HIREHOP_TOKEN) and no password login is configured");
+        console.warn("  ⚠ HireHop refused the API token — falling back to password login for this run");
+        hhAuth.mode = "login"; hhAuth.fellBack = true;
+        continue;
+      }
+    }
+    return { res, text };
+  }
+}
+const hhAuthNote = () => hhAuth.fellBack ? " · HireHop API token refused, used password login" : "";
+
 // ── Fetch repairs from HireHop (with retries) ────────────────────────────────
-async function fetchRepairs(jar, maxAttempts = 4, delayMs = 15000) {
+async function fetchRepairs(maxAttempts = 4, delayMs = 15000) {
   const url = `${HIREHOP_BASE}/reports/damaged_list.php`
             + `?depot=${encodeURIComponent(JSON.stringify(HIREHOP_DEPOT))}`;
   console.log(`  GET ${url}`);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const res  = await fetch(url, {
-        headers: { accept: "application/json", "x-requested-with": "XMLHttpRequest",
-                   referer: `${HIREHOP_BASE}/reports/damaged.php`, cookie: cookieStr(jar) },
-      });
-      const text = await res.text();
+      const { res, text } = await hhGet(url, `${HIREHOP_BASE}/reports/damaged.php`);
 
       if (res.status === 502 || res.status === 503 || res.status === 504) {
         throw new Error(`HTTP ${res.status} (transient)`);
@@ -175,14 +210,14 @@ async function main() {
   console.log("=== HireHop → Supabase  Repairs Sync ===");
   console.log(`    ${new Date().toISOString()}\n`);
 
-  const jar = await login();
+  console.log(`HireHop auth: ${hhAuth.mode === "token" ? "API token" : "password login (no HIREHOP_TOKEN set)"}`);
 
   console.log("\nFetching repair list from HireHop...");
-  const hhRows = await fetchRepairs(jar);
+  const hhRows = await fetchRepairs();
 
   if (!hhRows.length) {
     console.log("  ℹ️  Empty feed — no changes made.");
-    await writeSyncRun("success", "0 items in HireHop feed — no changes made");
+    await writeSyncRun("success", "0 items in HireHop feed — no changes made" + hhAuthNote());
     return;
   }
 
@@ -259,7 +294,7 @@ async function main() {
 
   console.log("\n✅ Sync complete");
   await writeSyncRun("success",
-    `${updated} updated · ${inserted} inserted · ${archived} archived · ${restored} restored`);
+    `${updated} updated · ${inserted} inserted · ${archived} archived · ${restored} restored${hhAuthNote()}`);
 }
 
 main().catch(async err => {
