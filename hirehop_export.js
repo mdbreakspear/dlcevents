@@ -41,8 +41,30 @@ const ALLOWED_COLUMNS = new Set([
   "Unapproved Costs","Profit","Margin","Paid","Job type","Status","Manager",
   "INVOICE STATUS","Reference","Client reference","Deliver to",
   "Delivery address","Email","Project name","Contact name","Mobile",
-  "Telephone","Goods out","Goods in"
+  "Telephone","Goods out","Goods in","TDRA License"
 ]);
+
+// ── TDRA License (HireHop job custom field) ────────────────────────────────
+// Custom fields come through the report flattened as "~<field id>" keys (see
+// "~JobCosts" below). The TDRA License field's id is found by name — the first
+// "~…" key containing "tdra" — so it keeps working whatever HireHop calls it
+// internally. Override with HIREHOP_TDRA_FIELD (e.g. "~TDRALicense") if needed.
+const TDRA_FIELD_ENV = (process.env.HIREHOP_TDRA_FIELD || "").trim();
+let tdraKey = null;
+function findTdraKey(rows) {
+  if (TDRA_FIELD_ENV) return TDRA_FIELD_ENV;
+  for (const r of rows) {
+    const k = Object.keys(r || {}).find(k => k.startsWith("~") && /tdra/i.test(k));
+    if (k) return k;
+  }
+  return null;
+}
+// "LM26-00996-01" — trimmed, upper-cased; blank → null
+function tdraValue(row) {
+  if (!tdraKey) return null;
+  const s = String(row[tdraKey] ?? "").trim();
+  return s ? s.toUpperCase() : null;
+}
 
 // HireHop API numeric status → text label
 // NOTE: The HireHop API returns different numeric codes to the web UI.
@@ -222,6 +244,7 @@ function transformRow(row) {
     "Client reference": row.CLIENT_REF ?? null,
     "Delivery address": row.VENUE_ADDRESS ?? null,
     "Deliver to":       row.VENUE      ?? null,
+    "TDRA License":     tdraValue(row),
   };
 
   const payload = {};
@@ -582,6 +605,14 @@ async function main() {
   const { from, upto } = getDateRange();
   console.log(`\nFetching report: ${from} → ${upto}`);
   const rows           = await fetchReport(from, upto);
+  tdraKey = findTdraKey(rows);
+  if (tdraKey) {
+    const filled = rows.filter(r => String(r[tdraKey] ?? "").trim()).length;
+    console.log(`  TDRA License field: ${tdraKey} (${filled} job(s) filled)`);
+  } else {
+    const custom = [...new Set(rows.flatMap(r => Object.keys(r || {}).filter(k => k.startsWith("~"))))];
+    console.warn(`  ⚠ No TDRA License custom field in the report. Custom fields seen: ${custom.join(", ") || "none"}`);
+  }
 
   // 2. Sync to Supabase — one read per table, compare in memory, one write per table
   console.log(`\nSyncing to Supabase (${J_TABLE})...`);
